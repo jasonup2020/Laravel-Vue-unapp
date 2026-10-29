@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      var coverSupport =
+        'CSS' in window &&
+        typeof CSS.supports === 'function' &&
+        (CSS.supports('top: env(a)') || CSS.supports('top: constant(a)'))
+      document.write(
+        '<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0' +
+          (coverSupport ? ', viewport-fit=cover' : '') +
+          '" />'
+      )
+    </script>
+    <title></title>
+    <style>
+      /* PC 顶部导航（仅 min-width:768px 显示；手机端隐藏） */
+      #pc-nav {
+        display: none;
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        height: 56px;
+        background: #fff;
+        border-bottom: 1px solid #eaeef3;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+        z-index: 9999;
+        align-items: center;
+        padding: 0 32px;
+        box-sizing: border-box;
+      }
+      #pc-nav .logo { font-weight: 700; font-size: 18px; color: #2979ff; margin-right: 32px; }
+      #pc-nav a { color: #333; text-decoration: none; margin-right: 24px; font-size: 14px; }
+      #pc-nav a:hover { color: #2979ff; }
+      @media screen and (min-width: 768px) {
+        #pc-nav { display: flex; }
+        body { padding-top: 56px; }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- PC 顶部导航（手机端隐藏，由底部 tabBar 替代） -->
+    <div id="pc-nav">
+      <span class="logo">JU C-Shop</span>
+      <a href="#/pages/index/index" data-i18n="nav.home">首页</a>
+      <a href="#/pages/product/list" data-i18n="nav.products">商品</a>
+      <a href="#/pages/message/index" data-i18n="nav.messages">消息</a>
+      <a href="#/pages/favorite/index" data-i18n="nav.favorites">收藏</a>
+      <a href="#/pages/mine/index" data-i18n="nav.mine">我的</a>
+      <a href="#/pages/login/index" data-i18n="nav.login" style="margin-left:auto">登录</a>
+    </div>
+    <script>
+      // PC 顶栏双语：读取 localStorage 的 ju_locale（与项目 i18n 一致）设置链接文本
+      (function () {
+        var NAV_I18N = {
+          'zh-CN': { home: '首页', products: '商品', messages: '消息', favorites: '收藏', mine: '我的', login: '登录' },
+          'en':    { home: 'Home', products: 'Products', messages: 'Messages', favorites: 'Favorites', mine: 'Mine', login: 'Login' }
+        }
+        function applyNav() {
+          var lang = 'zh-CN'
+          try {
+            var stored = localStorage.getItem('ju_locale')
+            if (stored === 'en' || stored === 'zh-CN') lang = stored
+          } catch (e) {}
+          var map = NAV_I18N[lang] || NAV_I18N['zh-CN']
+          document.querySelectorAll('#pc-nav a[data-i18n]').forEach(function (a) {
+            var key = a.getAttribute('data-i18n').replace('nav.', '')
+            if (map[key]) a.textContent = map[key]
+          })
+        }
+        applyNav()
+        // locale 切换后定时检查（项目 i18n 切换时会写 ju_locale）
+        setInterval(applyNav, 2000)
+        document.addEventListener('visibilitychange', applyNav)
+      })()
+    </script>
+    <div id="app"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,2688 @@
+# =============================================================================
+# Laravel13 API Skeleton - OpenAPI 3.0.3 接口文档
+# -----------------------------------------------------------------------------
+# 全局约定说明：
+#
+# 1) Bearer 双守卫隔离：
+#    - C 端普通用户使用 `Authorization: Bearer <token>`，对应守卫 `api`，
+#      数据源 `users` 表；
+#    - 管理员同样使用 `Authorization: Bearer <token>`，对应守卫 `admin-api`，
+#      数据源 `admins` 表；
+#    - JWT payload 携带 `guard` 字段；普通用户 token 不能访问 `/admin/*`，
+#      管理员 token 不能访问 C 端受鉴权接口，跨守卫访问一律 401。
+#
+# 2) X-Idempotency-Key 幂等防重复提交：
+#    - 仅 POST/PUT/DELETE 写接口生效；GET 直接跳过。
+#    - 前端生成 UUID v4 放入请求头 `X-Idempotency-Key`；
+#    - Redis 缓存上次响应，相同 key 在 TTL（默认 600s）内重复请求直接返回
+#      缓存结果，不重复执行业务；
+#    - key 缺失则放行（不强制）。
+#
+# 3) X-Client-Fingerprint 限流（后台动态配置）：
+#    - 复合限流 key = composite_rate:{path}:{ip}:{uid_{id}|fp_{fingerprint}}；
+#    - 已登录用户按守卫取 user_id / admin_id；游客使用浏览器指纹；
+#    - 指纹缺失降级仅用 IP；
+#    - 超限返回 429，并带响应头 X-RateLimit-Limit / X-RateLimit-Remaining。
+#    - 【设计变更】api.composite.rate 中间件不再写死次数/时长，规则存
+#      `rate_limit_rules` 表（GET/POST/PUT/DELETE /admin/rate-limit-rules），
+#      后台可改 max_attempts/decay_seconds/enabled；写操作后清 Redis 缓存
+#      `rate_limit:rules`（TTL 300s），多实例即时生效。无匹配规则兜底 60/60。
+#      代码层 `api.composite.rate:10,60` 仍可作为覆盖能力保留（默认不用）。
+#
+# 4) Skip-Desensitize 跳过脱敏：
+#    - 默认响应 data 中 mobile / id_card 等字段自动脱敏；
+#    - 管理员导出等特权场景可加请求头 `Skip-Desensitize: 1` 跳过脱敏，
+#      返回原始明文。
+#
+# 5) Accept-Language：
+#    - 支持 `zh-CN` / `en`，非法输入回退 `zh-CN`；也可通过 query `?lang=` 指定。
+#
+# 6) 分页：入参 `page`(默认1)、`page_size`(默认15，最大100)；
+#    返回 data = { list, total, page, page_size }。
+#
+# 7) 对外 ID：所有路径参数 {id} 均为 snow_id（雪花业务 ID），自增主键 id 已隐藏。
+#
+# 8) 动作级权限（RBAC）：
+#    - 权限 code 约定 `{resource}:{action}`，四基本动作 list/create/update/delete
+#      （查/增/改/删），自定义动作不限（export/audit/kick/cancel/approve/import 等），
+#      后台可按资源勾选增删改查与自定义动作（POST/PUT/DELETE /admin/permissions）；
+#    - AdminPermission 中间件按精确 code 校验，"能查"不代表能"改/删"，
+#      一个接口对应一个精确权限 code；
+#    - permissions 表含 `action`(varchar50) 与 `type`(1=system 预置 / 2=custom 自定义)。
+#
+# 9) 审计日志驱动化存储（设计变更：审计不落 MySQL）：
+#    - 管理员操作日志为海量 append-only 数据，**不写 MySQL**（不建
+#      admin_operation_logs 表）；
+#    - 默认驱动 file：写 `storage/logs/audit/audit-YYYY-MM-DD.log`（JSON 行），
+#      含 log_id/admin_id/url/method/ip/request_params/response_result/cost_ms/
+#      is_high_risk/created_at；
+#    - 可选驱动 elasticsearch：Guzzle `_bulk` 写索引 `audit_logs-YYYY.MM.DD`，
+#      通过 `AUDIT_LOG_DRIVER=file|elasticsearch` 切换，ES 不可达自动回退 file；
+#    - 读取由 `OperationLogService::read()` 提供（分页 + admin_id/日期过滤），
+#      文件驱动按 created_at 倒序解析当日与历史文件；
+#    - 保留策略：file 按 retention_days（默认 90）由 schedule 每日清理。
+#
+# 10) 统一状态码体系（HTTP 一律 200 + body.code）：
+#    - 所有响应 HTTP 状态码恒为 200（含错误）；前端按 body.code 判断业务结果。
+#    - code 约定：
+#        0      成功
+#        1      通用业务失败
+#        1001   参数错误
+#        1002   未认证 / token 过期 / 跨守卫越权 / 被踢下线
+#        1003   无权限（RBAC 校验失败）/ IP 黑名单
+#        1004   资源不存在
+#        1005   表单校验失败（data 为字段错误明细）
+#        1006   限流（429 语义）
+#        1007   冲突 / 重复提交（含幂等命中、重复收藏）
+#        1008   验证码错误 / 过期（登录接口）
+#        5000   服务器内部错误（不暴露堆栈）
+#        2xxxx  业务自定义码（如 2001 商品下架、2002 库存不足等）
+#    - success: code===0 时为 true，否则 false。
+#    - 本文档 components.responses 下的 Unauthorized/Forbidden/NotFound 等键
+#      仅为 OpenAPI 文档分组用途，**实际 HTTP 状态均为 200**，
+#      响应体中的 code 字段才是真实业务码。
+# =============================================================================
+openapi: 3.0.3
+
+info:
+  title: Laravel13 API Skeleton
+  version: 1.0.0
+  description: >-
+    生产级 Laravel 13 API 骨架接口文档。
+    双表 JWT 认证（C 端 users / 后台 admins）、RBAC 权限、动态菜单、
+    多端登录管控、Reverb WebSocket 站内消息、复合限流、幂等防重、
+    响应脱敏、IP 黑名单、回收站软删除恢复、操作审计日志、健康检查。
+    统一响应结构：{ success, code, msg, data }。
+
+servers:
+  - url: http://localhost:8000/api
+    description: local
+
+tags:
+  - name: 健康检查
+    description: DB / Redis 连通性探测
+  - name: 认证
+    description: C 端 / 管理员 登录、登出、刷新
+  - name: C端用户
+    description: 普通用户个人中心
+  - name: 商品
+    description: 商品只读（C 端）/ 全量 CRUD（管理员）
+  - name: 字典
+    description: 通用数据字典
+  - name: 消息
+    description: Reverb WebSocket 站内消息
+  - name: 收藏
+    description: 用户商品收藏（扩展示例）
+  - name: 管理员
+    description: 管理员自身与管理员账号管理
+  - name: 角色
+    description: RBAC 角色管理
+  - name: 权限
+    description: 权限码全表
+  - name: 菜单
+    description: 后台动态菜单树
+  - name: 用户管理
+    description: 管理员侧管理 C 端普通用户、在线终端、踢下线
+  - name: IP黑名单
+    description: 恶意 IP 封禁与解除
+  - name: 回收站
+    description: 软删除数据查询与恢复
+  - name: 操作日志
+    description: 管理员行为审计日志（驱动化存储，不落 MySQL，见文档顶部注释 9）
+  - name: 限流规则
+    description: 后台动态限流规则配置（次数/时长/启停，见文档顶部注释 3）
+  - name: 多语言
+    description: i18n 语言包下发与后台管理（公开读 + 管理员维护）
+
+# =============================================================================
+# 全局通用安全：所有受保护接口统一使用 Bearer JWT。
+# =============================================================================
+security:
+  - bearerAuth: []
+
+# =============================================================================
+# paths
+# =============================================================================
+paths:
+
+  # ---------------- 健康检查 ----------------
+  /health:
+    get:
+      operationId: healthIndex
+      tags: [健康检查]
+      summary: DB + Redis 连通性检查
+      security: []
+      responses:
+        '200':
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponse'
+              example:
+                success: true
+                code: 0
+                msg: "服务正常"
+                data:
+                  db: ok
+                  redis: ok
+
+  # ---------------- 多语言（公开读） ----------------
+  /locale/{lang}:
+    get:
+      operationId: publicLocaleShow
+      tags: [多语言]
+      summary: 拉取指定语言包（data={lang, md5, items:{key:value}}）
+      description: >-
+        前端启动时调用：先调 `/locale/{lang}/meta` 比对 md5，未变则用本地缓存；
+        变化则整包拉取。lang 支持 `zh-CN` / `en`，非法值返回 code=1004。
+      security: []
+      parameters:
+        - name: lang
+          in: path
+          required: true
+          description: 语言标识（zh-CN / en）；也可选填（路径 {lang?}），缺省用 Accept-Language 或回退 zh-CN
+          schema:
+            type: string
+            enum: [zh-CN, en]
+      responses:
+        '200':
+          description: 语言包；非法 lang 返回 HTTP 200 + body.code=1004
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          lang: { type: string, example: "zh-CN" }
+                          md5: { type: string, example: "d41d8cd98f00b204e9800998ecf8427e" }
+                          items:
+                            type: object
+                            additionalProperties: { type: string }
+                            example:
+                              success: "操作成功"
+                              fail: "操作失败"
+                              login.success: "登录成功"
+              example:
+                success: true
+                code: 0
+                msg: "操作成功"
+                data:
+                  lang: "zh-CN"
+                  md5: "9e107d9d372bb6826bd81d3542a419d6"
+                  items:
+                    success: "操作成功"
+                    fail: "操作失败"
+                    login.success: "登录成功"
+
+  /locale/{lang}/meta:
+    get:
+      operationId: publicLocaleMeta
+      tags: [多语言]
+      summary: 语言包轻量元信息（仅 lang + md5，用于前端缓存比对）
+      security: []
+      parameters:
+        - name: lang
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [zh-CN, en]
+      responses:
+        '200':
+          description: 元信息；非法 lang 返回 HTTP 200 + body.code=1004
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          lang: { type: string, example: "zh-CN" }
+                          md5: { type: string, example: "9e107d9d372bb6826bd81d3542a419d6" }
+
+  # ---------------- 验证码 ----------------
+  /captcha:
+    get:
+      operationId: publicCaptcha
+      tags: [认证]
+      summary: 获取图形验证码（登录前调用；data.captcha_id 随登录请求回传）
+      security: []
+      responses:
+        '200':
+          description: 验证码
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [captcha_id, image]
+                        properties:
+                          captcha_id:
+                            type: string
+                            example: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+                            description: "验证码唯一 ID（Redis 存储，TTL 5 分钟）"
+                          image:
+                            type: string
+                            format: uri
+                            example: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+                            description: "data:image/png;base64 编码的图片，前端直接 <img src> 渲染"
+              example:
+                success: true
+                code: 0
+                msg: "操作成功"
+                data:
+                  captcha_id: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+                  image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+
+  # ---------------- C 端认证 ----------------
+  /login:
+    post:
+      operationId: userLogin
+      tags: [认证]
+      summary: C 端普通用户登录（限流 5次/60秒；需先调 GET /captcha）
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/X-Client-Fingerprint'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, captcha_id, captcha_code]
+              properties:
+                email: { type: string, format: email, example: user@example.com }
+                password: { type: string, format: password, example: "password123" }
+                captcha_id:
+                  type: string
+                  description: "GET /captcha 返回的 captcha_id"
+                  example: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+                captcha_code:
+                  type: string
+                  description: "用户输入的验证码字符"
+                  example: "a3b9"
+            example:
+              email: user@example.com
+              password: "password123"
+              captcha_id: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+              captcha_code: "a3b9"
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LoginResult' }
+              example:
+                success: true
+                code: 0
+                msg: "登录成功"
+                data:
+                  token: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+                  expires_in: 3600
+                  user:
+                    snow_id: 189000000000001
+                    name: "张三"
+                    email: "user@example.com"
+                    status: 1
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '1008': { $ref: '#/components/responses/CaptchaInvalid' }
+
+  /refresh:
+    post:
+      operationId: userRefresh
+      tags: [认证]
+      summary: 刷新 C 端 token（旧 token 自动进黑名单）
+      security: []
+      responses:
+        '200':
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token: { type: string }
+                          expires_in: { type: integer, example: 3600 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /logout:
+    post:
+      operationId: userLogout
+      tags: [认证]
+      summary: C 端登出（当前 token 进黑名单，并移出在线设备集合）
+      responses:
+        '200':
+          description: 登出成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+              example:
+                success: true
+                code: 0
+                msg: "退出登录成功"
+                data: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------- C 端个人中心 ----------------
+  /me:
+    get:
+      operationId: userProfile
+      tags: [C端用户]
+      summary: 当前登录用户个人信息（响应脱敏）
+      responses:
+        '200':
+          description: 个人信息
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      operationId: userUpdateProfile
+      tags: [C端用户]
+      summary: 更新个人资料（name / email）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: "张三" }
+                email: { type: string, format: email, example: "new@example.com" }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /me/password:
+    put:
+      operationId: userChangePassword
+      tags: [C端用户]
+      summary: 修改当前用户密码（幂等）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, password, password_confirmation]
+              properties:
+                old_password: { type: string, format: password, example: "old123" }
+                password: { type: string, format: password, example: "new12345" }
+                password_confirmation: { type: string, format: password, example: "new12345" }
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- C 端商品只读 ----------------
+  /products:
+    get:
+      operationId: userProductList
+      tags: [商品]
+      summary: C 端商品分页列表（只读）
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: status, in: query, schema: { type: integer, enum: [0,1] }, description: "上下架状态过滤" }
+      responses:
+        '200':
+          description: 商品分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /products/{id}:
+    get:
+      operationId: userProductShow
+      tags: [商品]
+      summary: C 端商品详情（{id}=snow_id）
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 商品详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Product' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- C 端字典只读 ----------------
+  /dicts/{type}:
+    get:
+      operationId: userDictShow
+      tags: [字典]
+      summary: 按 type 获取字典选项（Redis 缓存）
+      security: []
+      parameters:
+        - { name: type, in: path, required: true, schema: { type: string }, example: "product_status" }
+      responses:
+        '200':
+          description: 字典项列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Dict' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- C 端消息 ----------------
+  /messages:
+    get:
+      operationId: userMessageIndex
+      tags: [消息]
+      summary: 我的消息分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: is_read, in: query, schema: { type: integer, enum: [0,1] } }
+      responses:
+        '200':
+          description: 消息分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /messages/unread-count:
+    get:
+      operationId: userMessageUnreadCount
+      tags: [消息]
+      summary: 未读消息数
+      responses:
+        '200':
+          description: 未读数
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          unread_count: { type: integer, example: 3 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /messages/read/{id}:
+    put:
+      operationId: userMessageMarkRead
+      tags: [消息]
+      summary: 标记单条消息已读
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 }, description: "消息 snow_id" }
+      responses:
+        '200':
+          description: 已标记
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /messages/read-all:
+    put:
+      operationId: userMessageMarkAllRead
+      tags: [消息]
+      summary: 全部已读
+      responses:
+        '200':
+          description: 全部已读
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------- C 端收藏 ----------------
+  /favorites:
+    post:
+      operationId: userFavoriteStore
+      tags: [收藏]
+      summary: 收藏商品（幂等；重复收藏返回 409）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product_id]
+              properties:
+                product_id: { type: integer, format: int64, example: 189000000000100 }
+      responses:
+        '201':
+          description: 收藏成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      operationId: userFavoriteIndex
+      tags: [收藏]
+      summary: 我的收藏分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: 收藏分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /favorites/status/{productId}:
+    get:
+      operationId: userFavoriteStatus
+      tags: [收藏]
+      summary: 是否已收藏某商品
+      parameters:
+        - { name: productId, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 收藏状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          is_favorited: { type: boolean, example: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /favorites/{id}:
+    delete:
+      operationId: userFavoriteDestroy
+      tags: [收藏]
+      summary: 取消收藏（软删除）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 }, description: "收藏记录 snow_id" }
+      responses:
+        '200':
+          description: 已取消
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 管理员认证 ----------------
+  /admin/login:
+    post:
+      operationId: adminLogin
+      tags: [认证]
+      summary: 管理员登录（限流 5次/60秒；需先调 GET /captcha）
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/X-Client-Fingerprint'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, captcha_id, captcha_code]
+              properties:
+                username: { type: string, example: admin }
+                password: { type: string, format: password, example: "admin123" }
+                captcha_id:
+                  type: string
+                  description: "GET /captcha 返回的 captcha_id"
+                  example: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+                captcha_code:
+                  type: string
+                  description: "用户输入的验证码字符"
+                  example: "a3b9"
+            example:
+              username: admin
+              password: "admin123"
+              captcha_id: "captcha_65f1c2d4e8b9a01234567890abcdef12"
+              captcha_code: "a3b9"
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LoginResult' }
+              example:
+                success: true
+                code: 0
+                msg: "登录成功"
+                data:
+                  token: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+                  expires_in: 3600
+                  user:
+                    snow_id: 189000000000001
+                    username: admin
+                    nickname: "超级管理员"
+                    avatar: ""
+                    status: 1
+                    roles: [super-admin]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '1008': { $ref: '#/components/responses/CaptchaInvalid' }
+
+  /admin/refresh:
+    post:
+      operationId: adminRefresh
+      tags: [认证]
+      summary: 刷新管理员 token
+      security: []
+      responses:
+        '200':
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token: { type: string }
+                          expires_in: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /admin/logout:
+    post:
+      operationId: adminLogout
+      tags: [认证]
+      summary: 管理员登出
+      responses:
+        '200':
+          description: 登出成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------- 管理员自身 ----------------
+  /admin/me:
+    get:
+      operationId: adminProfile
+      tags: [管理员]
+      summary: 当前管理员信息
+      responses:
+        '200':
+          description: 管理员信息
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Admin' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/me/password:
+    put:
+      operationId: adminChangePassword
+      tags: [管理员]
+      summary: 修改本人密码（高危操作，记录审计日志）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, password, password_confirmation]
+              properties:
+                old_password: { type: string, format: password }
+                password: { type: string, format: password }
+                password_confirmation: { type: string, format: password }
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- 菜单 ----------------
+  /admin/menu/my-tree:
+    get:
+      operationId: adminMenuMyTree
+      tags: [菜单]
+      summary: 当前管理员可见菜单树（前端登录后调用，优先读 Redis）
+      responses:
+        '200':
+          description: 菜单树
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminMenu' }
+              example:
+                success: true
+                code: 0
+                msg: "菜单加载成功"
+                data:
+                  - snow_id: 1001
+                    parent_id: 0
+                    title: "工作台"
+                    path: "/dashboard"
+                    component: "dashboard/index"
+                    icon: "dashboard"
+                    permission_code: null
+                    sort: 1
+                    is_show: true
+                    is_cache: true
+                    is_external: false
+                    children: []
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/menu/all-tree:
+    get:
+      operationId: adminMenuAllTree
+      tags: [菜单]
+      summary: 全部菜单树（菜单配置页，直读库）
+      responses:
+        '200':
+          description: 全部菜单树
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminMenu' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/menu:
+    post:
+      operationId: adminMenuStore
+      tags: [菜单]
+      summary: 新建菜单（清空全部菜单缓存）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MenuInput'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/menu/{id}:
+    put:
+      operationId: adminMenuUpdate
+      tags: [菜单]
+      summary: 更新菜单（清缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MenuInput' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+    delete:
+      operationId: adminMenuDestroy
+      tags: [菜单]
+      summary: 删除菜单（清缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 权限 ----------------
+  /admin/permissions:
+    get:
+      operationId: adminPermissionIndex
+      tags: [权限]
+      summary: 权限全表（按 group 分组列出，含动作级 action/type）
+      responses:
+        '200':
+          description: 权限列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Permission' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminPermissionStore
+      tags: [权限]
+      summary: 新建权限（含自定义动作；写后清 `admin:permissions:{adminId}` 全量缓存）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PermissionInput' }
+            example:
+              name: "商品导出"
+              code: "admin:product:export"
+              group: "product"
+              action: "export"
+              type: 2
+              status: 1
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/permissions/{id}:
+    put:
+      operationId: adminPermissionUpdate
+      tags: [权限]
+      summary: 修改权限（name/action/type/status 等；system 预置可启停不可删）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                action: { type: string, maxLength: 50 }
+                type: { type: integer, enum: [1,2] }
+                status: { type: integer, enum: [0,1] }
+                remark: { type: string }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+    delete:
+      operationId: adminPermissionDestroy
+      tags: [权限]
+      summary: 删除自定义权限（type=1 system 预置不可删，否则 409）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------- 角色 ----------------
+  /admin/roles:
+    get:
+      operationId: adminRoleIndex
+      tags: [角色]
+      summary: 角色分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: 角色分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminRoleStore
+      tags: [角色]
+      summary: 新建角色（高危，审计日志）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, code]
+              properties:
+                name: { type: string, example: "运营" }
+                code: { type: string, example: "operator" }
+                remark: { type: string, example: "日常运营角色" }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/roles/{id}:
+    put:
+      operationId: adminRoleUpdate
+      tags: [角色]
+      summary: 更新角色（高危）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                remark: { type: string }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: adminRoleDestroy
+      tags: [角色]
+      summary: 删除角色（高危）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/roles/{id}/permissions:
+    put:
+      operationId: adminRoleAssignPermissions
+      tags: [角色]
+      summary: 给角色分配权限（清该角色下管理员权限缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permission_ids]
+              properties:
+                permission_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                  example: [101, 102, 103]
+      responses:
+        '200':
+          description: 分配成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/roles/{id}/menus:
+    put:
+      operationId: adminRoleAssignMenus
+      tags: [角色]
+      summary: 给角色分配菜单（清该角色下管理员菜单缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [menu_ids]
+              properties:
+                menu_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                  example: [1001, 1002, 1010]
+      responses:
+        '200':
+          description: 分配成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- 管理员账号管理 ----------------
+  /admin/admins:
+    get:
+      operationId: adminAdminsIndex
+      tags: [管理员]
+      summary: 管理员账号分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: 管理员分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminAdminsStore
+      tags: [管理员]
+      summary: 新建管理员（高危）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, nickname]
+              properties:
+                username: { type: string, example: "operator01" }
+                password: { type: string, format: password, example: "Op@ssw0rd" }
+                nickname: { type: string, example: "运营一号" }
+                email: { type: string, format: email }
+                avatar: { type: string, format: uri }
+                role_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/admins/{id}:
+    put:
+      operationId: adminAdminsUpdate
+      tags: [管理员]
+      summary: 更新管理员资料（高危）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nickname: { type: string }
+                email: { type: string, format: email }
+                avatar: { type: string, format: uri }
+                role_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: adminAdminsDestroy
+      tags: [管理员]
+      summary: 删除管理员（高危，软删除）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/admins/{id}/password:
+    put:
+      operationId: adminAdminsResetPassword
+      tags: [管理员]
+      summary: 重置指定管理员密码（高危）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, password_confirmation]
+              properties:
+                password: { type: string, format: password }
+                password_confirmation: { type: string, format: password }
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/admins/{id}/status:
+    put:
+      operationId: adminAdminsUpdateStatus
+      tags: [管理员]
+      summary: 启用/禁用管理员
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: integer, enum: [0,1] }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- C 端用户管理 ----------------
+  /admin/users:
+    get:
+      operationId: adminUsersIndex
+      tags: [用户管理]
+      summary: C 端用户分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: keyword, in: query, schema: { type: string }, description: "按 name/email 模糊搜索" }
+      responses:
+        '200':
+          description: 用户分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users/{id}:
+    get:
+      operationId: adminUsersShow
+      tags: [用户管理]
+      summary: C 端用户详情
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 用户详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/status:
+    put:
+      operationId: adminUsersUpdateStatus
+      tags: [用户管理]
+      summary: 启用/禁用 C 端用户
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: integer, enum: [0,1] }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/online:
+    get:
+      operationId: adminUsersOnline
+      tags: [用户管理]
+      summary: 查看 C 端用户在线终端数量
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 在线终端
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          count: { type: integer, example: 2 }
+                          devices:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                token_preview: { type: string }
+                                logged_in_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users/{id}/kick:
+    post:
+      operationId: adminUsersKick
+      tags: [用户管理]
+      summary: 强制踢出 C 端用户全部终端（高危；清空 Redis token 集合，全部 token 进黑名单）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      responses:
+        '200':
+          description: 已全部踢下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+              example:
+                success: true
+                code: 0
+                msg: "已强制下线该用户全部终端"
+                data:
+                  kicked: 3
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 管理员商品 ----------------
+  /admin/products:
+    get:
+      operationId: adminProductIndex
+      tags: [商品]
+      summary: 商品分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: status, in: query, schema: { type: integer, enum: [0,1] } }
+      responses:
+        '200':
+          description: 商品分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminProductStore
+      tags: [商品]
+      summary: 新建商品
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/products/{id}:
+    put:
+      operationId: adminProductUpdate
+      tags: [商品]
+      summary: 更新商品
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: adminProductDestroy
+      tags: [商品]
+      summary: 删除商品（软删除）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 管理员字典 ----------------
+  /admin/dicts:
+    get:
+      operationId: adminDictIndex
+      tags: [字典]
+      summary: 字典分页（可按 type 过滤）
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: type, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: 字典分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminDictStore
+      tags: [字典]
+      summary: 新建字典项（写后清字典缓存）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DictInput' }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/dicts/{id}:
+    put:
+      operationId: adminDictUpdate
+      tags: [字典]
+      summary: 更新字典项（清缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DictInput' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: adminDictDestroy
+      tags: [字典]
+      summary: 删除字典项（物理删除，dicts 表无软删列）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 管理员消息 ----------------
+  /admin/messages:
+    get:
+      operationId: adminMessageIndex
+      tags: [消息]
+      summary: 消息分页（含筛选）
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: receiver_type, in: query, schema: { type: string, enum: [user, admin, all_user, all_admin] } }
+        - { name: msg_type, in: query, schema: { type: string, enum: [announce, biz, warn] } }
+      responses:
+        '200':
+          description: 消息分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminMessageSend
+      tags: [消息]
+      summary: 发送站内消息（定向用户/管理员 / 系统公告；Reverb 实时推送）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver_type, msg_type, title, content]
+              properties:
+                receiver_type:
+                  type: string
+                  enum: [user, admin, all_user, all_admin]
+                  example: user
+                receiver_id:
+                  type: integer
+                  format: int64
+                  description: "接收人 snow_id；广播场景为 null"
+                  example: 189000000000123
+                msg_type:
+                  type: string
+                  enum: [announce, biz, warn]
+                  example: biz
+                title: { type: string, example: "订单已发货" }
+                content: { type: string, example: "您的订单 #12345 已发货，预计 2 天送达。" }
+                extra:
+                  type: object
+                  description: "扩展参数（跳转 url、业务 id 等）"
+                  example: { url: "/order/12345", order_id: 12345 }
+                is_pop: { type: boolean, example: false }
+            example:
+              receiver_type: user
+              receiver_id: 189000000000123
+              msg_type: biz
+              title: "订单已发货"
+              content: "您的订单 #12345 已发货。"
+              extra: { url: "/order/12345", order_id: 12345 }
+              is_pop: false
+      responses:
+        '201':
+          description: 发送成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+              example:
+                success: true
+                code: 0
+                msg: "消息发送成功"
+                data: { snow_id: 189000000000501, receiver_type: user, receiver_id: 189000000000123 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- 管理员收藏 ----------------
+  /admin/favorites:
+    get:
+      operationId: adminFavoriteIndex
+      tags: [收藏]
+      summary: 收藏列表（可按 user_id / product_id 过滤）
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: user_id, in: query, schema: { type: integer, format: int64 } }
+        - { name: product_id, in: query, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 收藏分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------- 操作日志 ----------------
+  /admin/operation-logs:
+    get:
+      operationId: adminOperationLogIndex
+      tags: [操作日志]
+      summary: 审计日志分页（读驱动化存储：默认 file JSON 行，可选 Elasticsearch；不落 MySQL）
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: admin_id, in: query, schema: { type: integer, format: int64 } }
+        - { name: is_high_risk, in: query, schema: { type: integer, enum: [0,1] } }
+        - { name: date_from, in: query, schema: { type: string, format: date }, description: "起始日期 YYYY-MM-DD" }
+        - { name: date_to, in: query, schema: { type: string, format: date }, description: "结束日期 YYYY-MM-DD" }
+      responses:
+        '200':
+          description: 日志分页（file 驱动按 created_at 倒序解析当日与历史 audit-*.log）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------- 多语言（管理员维护） ----------------
+  /admin/locale/languages:
+    get:
+      operationId: adminLocaleLanguages
+      tags: [多语言]
+      summary: 列出全部可用语言（data.languages=[{lang,name,md5,updated_at}]）
+      description: 权限 `admin:i18n:list`
+      responses:
+        '200':
+          description: 语言列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          languages:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                lang: { type: string, example: "zh-CN" }
+                                name: { type: string, example: "简体中文" }
+                                md5: { type: string }
+                                updated_at: { type: string, format: date-time }
+              example:
+                success: true
+                code: 0
+                msg: "操作成功"
+                data:
+                  languages:
+                    - { lang: "zh-CN", name: "简体中文", md5: "9e107d9d372bb6826bd81d3542a419d6", updated_at: "2026-10-27T10:00:00+08:00" }
+                    - { lang: "en", name: "English", md5: "a1b2c3d4e5f6...", updated_at: "2026-10-27T10:00:00+08:00" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/locale/refresh:
+    post:
+      operationId: adminLocaleRefresh
+      tags: [多语言]
+      summary: 刷新语言包缓存（可选 body.lang 指定单个，不带则清全部）
+      description: 权限 `admin:i18n:refresh`
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                lang: { type: string, enum: [zh-CN, en] }
+            example:
+              lang: "zh-CN"
+      responses:
+        '200':
+          description: 刷新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+              example:
+                success: true
+                code: 0
+                msg: "操作成功"
+                data: { cleared: ["zh-CN"] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/locale/{lang}:
+    get:
+      operationId: adminLocaleShow
+      tags: [多语言]
+      summary: 查看指定语言包全量（含 md5 + items）
+      description: 权限 `admin:i18n:list`
+      parameters:
+        - name: lang
+          in: path
+          required: true
+          schema: { type: string, enum: [zh-CN, en] }
+      responses:
+        '200':
+          description: 语言包
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          lang: { type: string }
+                          md5: { type: string }
+                          items:
+                            type: object
+                            additionalProperties: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: adminLocaleUpdate
+      tags: [多语言]
+      summary: 覆盖更新语言包 items（仅覆盖已存在 key；新增 key 被跳过，返回 data.skipped）
+      description: 权限 `admin:i18n:update`；写后清该语言缓存并重算 md5。
+      parameters:
+        - name: lang
+          in: path
+          required: true
+          schema: { type: string, enum: [zh-CN, en] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: object
+                  additionalProperties: { type: string }
+              example:
+                items:
+                  success: "操作成功（已更新）"
+                  login.success: "登录成功（已更新）"
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          lang: { type: string }
+                          md5: { type: string }
+                          updated:
+                            type: integer
+                            example: 2
+                            description: "实际更新的 key 数量"
+                          skipped:
+                            type: array
+                            items: { type: string }
+                            example: ["new.key.never.existed"]
+                            description: "被跳过的 key（不存在于原语言包）"
+              example:
+                success: true
+                code: 0
+                msg: "操作成功"
+                data:
+                  lang: "zh-CN"
+                  md5: "newmd5hash..."
+                  updated: 2
+                  skipped: ["new.key.never.existed"]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- IP 黑名单 ----------------
+  /admin/ip-blacklist:
+    get:
+      operationId: adminIpBlacklistIndex
+      tags: [IP黑名单]
+      summary: 封禁 IP 分页
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: 分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminIpBlacklistStore
+      tags: [IP黑名单]
+      summary: 新增封禁 IP
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ip]
+              properties:
+                ip: { type: string, example: "203.0.113.66" }
+                remark: { type: string, example: "恶意扫描" }
+                expire_at:
+                  type: string
+                  format: date-time
+                  description: "过期时间，null 表示永久封禁"
+                  example: "2026-12-31T23:59:59+08:00"
+      responses:
+        '201':
+          description: 封禁成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/ip-blacklist/{id}:
+    delete:
+      operationId: adminIpBlacklistDestroy
+      tags: [IP黑名单]
+      summary: 解除封禁
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 解除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- 回收站 ----------------
+  /admin/recycle-bin/{resource}:
+    get:
+      operationId: adminRecycleBinIndex
+      tags: [回收站]
+      summary: 查询已软删除数据（resource 白名单：products/users/admins/admin_menus/roles/messages/user_favorites）
+      parameters:
+        - name: resource
+          in: path
+          required: true
+          description: 资源名
+          schema:
+            type: string
+            enum: [products, users, admins, admin_menus, roles, messages, user_favorites]
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: 回收站分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/recycle-bin/{resource}/{id}/restore:
+    put:
+      operationId: adminRecycleBinRestore
+      tags: [回收站]
+      summary: 单条恢复
+      parameters:
+        - name: resource
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [products, users, admins, admin_menus, roles, messages, user_favorites]
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 }, description: "记录 snow_id" }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      responses:
+        '200':
+          description: 恢复成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/recycle-bin/{resource}/restore-batch:
+    put:
+      operationId: adminRecycleBinRestoreBatch
+      tags: [回收站]
+      summary: 批量恢复（ids=snow_id 列表）
+      parameters:
+        - name: resource
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [products, users, admins, admin_menus, roles, messages, user_favorites]
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                  example: [189000000000001, 189000000000002]
+      responses:
+        '200':
+          description: 批量恢复成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ---------------- 限流规则（后台动态配置，#65-68） ----------------
+  /admin/rate-limit-rules:
+    get:
+      operationId: adminRateLimitRuleIndex
+      tags: [限流规则]
+      summary: 限流规则分页
+      description: >-
+        列出 `rate_limit_rules` 表全部规则；运行时中间件按
+        `rule_key == routeName → rule_key == path → api:global/admin:global`
+        顺序匹配，无匹配兜底 60/60。
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/page_size'
+        - { name: rule_key, in: query, schema: { type: string }, description: "按 rule_key 模糊过滤" }
+      responses:
+        '200':
+          description: 规则分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiResponseData' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: adminRateLimitRuleStore
+      tags: [限流规则]
+      summary: 新增限流规则（写后清 Redis `rate_limit:rules` 缓存，多实例即时生效）
+      parameters:
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RateLimitRuleInput' }
+            example:
+              rule_key: "login"
+              max_attempts: 5
+              decay_seconds: 60
+              enabled: 1
+              remark: "登录防爆破"
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /admin/rate-limit-rules/{id}:
+    put:
+      operationId: adminRateLimitRuleUpdate
+      tags: [限流规则]
+      summary: 修改限流规则（次数/时长/启停；写后清缓存）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/X-Idempotency-Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rule_key: { type: string }
+                max_attempts: { type: integer, minimum: 1 }
+                decay_seconds: { type: integer, minimum: 1 }
+                enabled: { type: integer, enum: [0,1] }
+                remark: { type: string }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+    delete:
+      operationId: adminRateLimitRuleDestroy
+      tags: [限流规则]
+      summary: 删除限流规则（写后清缓存；被删规则回退兜底 60/60 或更具体的上级规则）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+# =============================================================================
+# components
+# =============================================================================
+components:
+
+  # ---------------- 安全方案 ----------------
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        JWT Bearer Token。C 端用户与管理员均使用本 scheme；
+        守卫由路由中间件（auth:api / auth:admin-api）区分，
+        JWT payload 内含 `guard` 字段，跨守卫访问一律 401。
+
+  # ---------------- 通用参数 ----------------
+  parameters:
+    X-Client-Fingerprint:
+      name: X-Client-Fingerprint
+      in: header
+      required: false
+      description: 浏览器指纹，用于复合限流；缺失时降级仅按 IP 限流。
+      schema: { type: string, example: "fp_9f1c2d4e" }
+
+    X-Idempotency-Key:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        幂等键（建议 UUID v4）。POST/PUT/DELETE 写接口携带后，
+        相同 key 在 TTL（默认 600s）内重复请求将直接返回首次结果，
+        不重复执行业务；缺失则放行。
+      schema: { type: string, example: "b3c9d8a2-1f4e-4a7b-9c2d-8e7f6a5b4c3d" }
+
+    Accept-Language:
+      name: Accept-Language
+      in: header
+      required: false
+      description: 语言偏好，支持 zh-CN / en；非法值回退 zh-CN。
+      schema: { type: string, enum: [zh-CN, en], default: zh-CN }
+
+    Skip-Desensitize:
+      name: Skip-Desensitize
+      in: header
+      required: false
+      description: >-
+        设为 `1` 时跳过响应脱敏（mobile/id_card 返回原始明文），
+        仅管理员特权场景使用。
+      schema: { type: string, enum: ["0", "1"], default: "0" }
+
+    page:
+      name: page
+      in: query
+      required: false
+      description: 页码，从 1 开始。
+      schema: { type: integer, minimum: 1, default: 1 }
+
+    page_size:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数，默认 15，最大 100（超限自动钳制）。
+      schema: { type: integer, minimum: 1, maximum: 100, default: 15 }
+
+  # ---------------- Schemas ----------------
+  schemas:
+
+    ApiResponse:
+      type: object
+      description: 统一响应结构（message() 助手输出）
+      required: [success, code, msg, data]
+      properties:
+        success: { type: boolean, example: true, description: "code===0 时为 true，否则 false" }
+        code:
+          type: integer
+          description: >-
+            业务码（HTTP 状态恒为 200）：
+            0=成功；1=通用失败；
+            1001=参数错误；1002=未认证；1003=无权限；1004=不存在；
+            1005=校验失败；1006=限流；1007=冲突/重复提交；
+            1008=验证码错误/过期；
+            5000=服务器内部错误；2xxxx=业务自定义码。
+          example: 0
+        msg: { type: string, description: "提示文案（已按 Accept-Language 翻译）", example: "操作成功" }
+        data:
+          description: "业务数据；失败时一般为 null，1005 时为字段错误明细对象"
+          nullable: true
+      example:
+        success: true
+        code: 0
+        msg: "操作成功"
+        data: null
+
+    ApiResponseData:
+      type: object
+      description: 分页 data 结构
+      required: [list, total, page, page_size]
+      properties:
+        list:
+          type: array
+          items: { type: object }
+        total: { type: integer, example: 42 }
+        page: { type: integer, example: 1 }
+        page_size: { type: integer, example: 15 }
+
+    LoginResult:
+      type: object
+      description: 登录成功返回 data
+      required: [token, expires_in, user]
+      properties:
+        token: { type: string, description: "JWT access token" }
+        expires_in: { type: integer, description: "过期秒数（=config('jwt.ttl')*60）", example: 3600 }
+        user:
+          type: object
+          description: "当前登录用户/管理员简要信息"
+
+    User:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64, example: 189000000000001 }
+        name: { type: string, example: "张三" }
+        email: { type: string, format: email, example: "user@example.com" }
+        status: { type: integer, enum: [0,1], description: "1启用 0禁用" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Admin:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64, example: 189000000000001 }
+        username: { type: string, example: "admin" }
+        nickname: { type: string, example: "超级管理员" }
+        email: { type: string, format: email }
+        avatar: { type: string, format: uri, nullable: true }
+        status: { type: integer, enum: [0,1] }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/Role' }
+        created_at: { type: string, format: date-time }
+
+    Role:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        name: { type: string, example: "运营" }
+        code: { type: string, example: "operator" }
+        remark: { type: string, nullable: true }
+        permissions:
+          type: array
+          items: { $ref: '#/components/schemas/Permission' }
+        menus:
+          type: array
+          items: { $ref: '#/components/schemas/AdminMenu' }
+
+    Permission:
+      type: object
+      description: 动作级权限（code = {resource}:{action}）
+      properties:
+        snow_id: { type: integer, format: int64 }
+        name: { type: string, example: "商品列表" }
+        code: { type: string, example: "admin:product:list" }
+        group: { type: string, example: "product", description: "按资源/模块分组" }
+        action:
+          type: string
+          maxLength: 50
+          example: "list"
+          description: "动作 list/create/update/delete 或自定义 export/audit/kick/cancel/approve/import 等"
+        type:
+          type: integer
+          enum: [1, 2]
+          example: 1
+          description: "1=system 预置 / 2=custom 自定义（system 预置不可删除）"
+        status: { type: integer, enum: [0,1], example: 1, description: "1启用 0禁用" }
+
+    PermissionInput:
+      type: object
+      description: 新建/更新自定义动作权限入参
+      required: [name, code, action, group]
+      properties:
+        name: { type: string, example: "商品导出" }
+        code: { type: string, example: "admin:product:export" }
+        group: { type: string, example: "product" }
+        action:
+          type: string
+          maxLength: 50
+          example: "export"
+        type:
+          type: integer
+          enum: [1, 2]
+          default: 2
+          description: "新建自定义权限默认 2=custom"
+        status: { type: integer, enum: [0,1], default: 1 }
+
+    AdminMenu:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        parent_id: { type: integer, example: 0 }
+        title: { type: string, example: "商品管理" }
+        path: { type: string, example: "/product" }
+        component: { type: string, nullable: true, example: "product/index" }
+        icon: { type: string, nullable: true }
+        permission_code: { type: string, nullable: true, example: "admin:product:list" }
+        sort: { type: integer, example: 1 }
+        is_show: { type: boolean, example: true }
+        is_cache: { type: boolean, example: true }
+        is_external: { type: boolean, example: false }
+        external_url: { type: string, nullable: true }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/AdminMenu' }
+
+    MenuInput:
+      type: object
+      required: [title, path]
+      properties:
+        parent_id: { type: integer, default: 0 }
+        title: { type: string, example: "商品管理" }
+        path: { type: string, example: "/product" }
+        component: { type: string, nullable: true }
+        icon: { type: string, nullable: true }
+        permission_code: { type: string, nullable: true }
+        sort: { type: integer, default: 0 }
+        is_show: { type: boolean, default: true }
+        is_cache: { type: boolean, default: true }
+        is_external: { type: boolean, default: false }
+        external_url: { type: string, nullable: true }
+
+    Product:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        name: { type: string, example: "示例商品" }
+        desc: { type: string, nullable: true }
+        price: { type: number, format: float, example: 99.50 }
+        status: { type: integer, enum: [0,1], description: "1上架 0下架" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ProductInput:
+      type: object
+      required: [name, price]
+      properties:
+        name: { type: string, example: "示例商品" }
+        desc: { type: string }
+        price: { type: number, format: float, example: 99.50 }
+        status: { type: integer, enum: [0,1], default: 1 }
+
+    Dict:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        type: { type: string, example: "product_status" }
+        label: { type: string, example: "上架" }
+        value: { type: string, example: "1" }
+        sort: { type: integer, example: 1 }
+        status: { type: integer, enum: [0,1] }
+
+    DictInput:
+      type: object
+      required: [type, label, value]
+      properties:
+        type: { type: string, example: "product_status" }
+        label: { type: string, example: "上架" }
+        value: { type: string, example: "1" }
+        sort: { type: integer, default: 0 }
+        status: { type: integer, enum: [0,1], default: 1 }
+
+    Message:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        receiver_type: { type: string, enum: [user, admin, all_user, all_admin] }
+        receiver_id: { type: integer, format: int64, nullable: true }
+        msg_type: { type: string, enum: [announce, biz, warn] }
+        title: { type: string }
+        content: { type: string }
+        extra: { type: object, nullable: true }
+        is_read: { type: boolean, example: false }
+        is_pop: { type: boolean, example: false }
+        created_at: { type: string, format: date-time }
+
+    Favorite:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64, description: "C 端用户 snow_id" }
+        product_id: { type: integer, format: int64, description: "商品 snow_id" }
+        product: { $ref: '#/components/schemas/Product' }
+        created_at: { type: string, format: date-time }
+
+    IpBlacklist:
+      type: object
+      properties:
+        snow_id: { type: integer, format: int64 }
+        ip: { type: string, example: "203.0.113.66" }
+        remark: { type: string, nullable: true }
+        expire_at: { type: string, format: date-time, nullable: true, description: "null=永久封禁" }
+        created_at: { type: string, format: date-time }
+
+    AdminOperationLog:
+      type: object
+      description: >-
+        审计日志条目（驱动化存储：默认 file JSON 行
+        `storage/logs/audit/audit-YYYY-MM-DD.log`，可选 Elasticsearch 索引
+        `audit_logs-YYYY.MM.DD`；**不落 MySQL**，见文档顶部注释 9）。
+        字段与原 admin_operation_logs 表保持一致，仅作数据结构参考。
+      properties:
+        log_id:
+          type: string
+          description: "审计日志 ID（毫秒时间戳+随机串）"
+          example: "1730000000123-ab12cd"
+        admin_id: { type: integer, format: int64, nullable: true }
+        url: { type: string }
+        method: { type: string, example: "POST" }
+        ip: { type: string }
+        request_params: { type: string, nullable: true, description: "JSON 字符串，截断 2000 字符；密码字段已脱敏 ***" }
+        response_result: { type: string, nullable: true, description: "JSON 字符串，截断 2000 字符" }
+        cost_ms: { type: integer, nullable: true, example: 42 }
+        is_high_risk: { type: boolean, description: "true=高危：改密码/改角色/踢用户等" }
+        created_at: { type: string, format: date-time }
+
+    RateLimitRule:
+      type: object
+      description: 后台动态限流规则（rate_limit_rules 表；写后清 Redis `rate_limit:rules` 缓存）
+      properties:
+        snow_id: { type: integer, format: int64 }
+        rule_key:
+          type: string
+          example: "login"
+          description: >-
+            路由/分组标识，唯一。常见值：`api:global`、`admin:global`、
+            `login`、`admin:login`、`product:list` 等。
+        max_attempts: { type: integer, example: 60, description: "时间窗内最大请求次数" }
+        decay_seconds: { type: integer, example: 60, description: "时间窗秒数" }
+        enabled: { type: integer, enum: [0,1], default: 1, description: "1启用 0停用" }
+        remark: { type: string, nullable: true, example: "登录防爆破" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RateLimitRuleInput:
+      type: object
+      description: 新建/更新限流规则入参
+      required: [rule_key, max_attempts, decay_seconds]
+      properties:
+        rule_key: { type: string, example: "login" }
+        max_attempts: { type: integer, minimum: 1, example: 5 }
+        decay_seconds: { type: integer, minimum: 1, example: 60 }
+        enabled: { type: integer, enum: [0,1], default: 1 }
+        remark: { type: string }
+
+    Error:
+      type: object
+      description: 统一错误响应结构（HTTP 状态恒为 200，业务码见 code）
+      properties:
+        success: { type: boolean, example: false }
+        code: { type: integer, example: 1002, description: "业务码，见 ApiResponse.code 说明" }
+        msg: { type: string, example: "未登录或登录已过期" }
+        data:
+          nullable: true
+          description: "1005 时为字段错误明细对象；其余错误一般为 null"
+
+  # ---------------- 通用错误响应 ----------------
+  responses:
+
+    BadRequest:
+      description: 业务/参数错误（如回收站 resource 非法）——实际 HTTP 200，body.code=1001
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1001
+            msg: "不支持的回收站资源"
+            data: null
+
+    Unauthorized:
+      description: 未认证 / token 过期 / 跨守卫越权 / 账号被强制下线——实际 HTTP 200，body.code=1002
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1002
+            msg: "未登录或登录已过期"
+            data: null
+
+    Forbidden:
+      description: 无权限（RBAC 校验失败）或 IP 已被黑名单封禁——实际 HTTP 200，body.code=1003
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1003
+            msg: "无权限访问"
+            data: null
+
+    NotFound:
+      description: 资源不存在——实际 HTTP 200，body.code=1004
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1004
+            msg: "数据不存在"
+            data: null
+
+    Conflict:
+      description: 资源冲突（如重复收藏、幂等重复提交）——实际 HTTP 200，body.code=1007
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1007
+            msg: "已收藏过该商品"
+            data: null
+
+    CaptchaInvalid:
+      description: 验证码错误或过期——实际 HTTP 200，body.code=1008
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1008
+            msg: "验证码错误或已过期"
+            data: null
+
+    UnprocessableEntity:
+      description: 表单校验失败（data 为字段错误明细）——实际 HTTP 200，body.code=1005
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1005
+            msg: "输入校验失败"
+            data:
+              email: ["The email field is required."]
+              password: ["The password must be at least 6 characters."]
+
+    TooManyRequests:
+      description: 触发复合限流（IP + 用户ID + 浏览器指纹）——实际 HTTP 200，body.code=1006
+      headers:
+        X-RateLimit-Limit:
+          schema: { type: integer, example: 60 }
+        X-RateLimit-Remaining:
+          schema: { type: integer, example: 0 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1006
+            msg: "请求过于频繁，请稍后再试"
+            data: null
+
+    PayloadTooLarge:
+      description: 请求体超过 Nginx/PHP 限制（大表单 DOS 防护）——实际 HTTP 200，body.code=1
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 1
+            msg: "请求体过大"
+            data: null
+
+    InternalError:
+      description: 服务器内部错误（生产环境不暴露堆栈）——实际 HTTP 200，body.code=5000
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            code: 5000
+            msg: "服务器内部错误"
+            data: null

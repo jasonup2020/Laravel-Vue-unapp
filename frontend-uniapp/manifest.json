@@ -1,0 +1,85 @@
+{
+  "name": "laravel13-uniapp",
+  "appid": "__UNI__LAR13DEMO",
+  "description": "Laravel13 API 骨架配套 uni-app C 端模板",
+  "versionName": "1.0.0",
+  "versionCode": "100",
+  "transformPx": false,
+  "app-plus": {
+    "usingComponents": true,
+    "nvueStyleCompiler": "uni-app",
+    "compilerVersion": 3,
+    "splashscreen": {
+      "alwaysShowBeforeRender": true,
+      "waiting": true,
+      "autoclose": true,
+      "delay": 0
+    },
+    "modules": {},
+    "distribute": {
+      "android": {
+        "permissions": [
+          "<uses-permission android:name=\"android.permission.INTERNET\"/>"
+        ]
+      },
+      "ios": {},
+      "splashscreen": {
+        "alwaysShowBeforeRender": true,
+        "waiting": true,
+        "autoclose": true,
+        "delay": 0
+      },
+      "icons": {}
+    }
+  },
+  "quickapp": {},
+  "mp-weixin": {
+    "appid": "",
+    "setting": {
+      "urlCheck": false,
+      "es6": true,
+      "postcss": true,
+      "minified": true
+    },
+    "usingComponents": true,
+    "permission": {},
+    "requiredPrivateInfos": []
+  },
+  "mp-alipay": {
+    "usingComponents": true
+  },
+  "mp-baidu": {
+    "usingComponents": true
+  },
+  "mp-toutiao": {
+    "usingComponents": true
+  },
+  "uniStatistics": {
+    "enable": false
+  },
+  "h5": {
+    "title": "laravel13-uniapp",
+    "router": {
+      "mode": "hash",
+      "base": "/"
+    },
+    "devServer": {
+      "host": "0.0.0.0",
+      "port": 5173,
+      "https": false,
+      "proxy": {
+        "/api": {
+          "target": "http://localhost:8000",
+          "changeOrigin": true,
+          "secure": false
+        },
+        "/app": {
+          "target": "ws://localhost:8080",
+          "changeOrigin": true,
+          "ws": true
+        }
+      }
+    }
+  },
+  "vueVersion": "3"
+}
